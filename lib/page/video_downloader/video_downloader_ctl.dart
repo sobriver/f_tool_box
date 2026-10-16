@@ -7,6 +7,7 @@ import 'package:get/get.dart';
 import 'package:path/path.dart' as path;
 
 import '../../utils/toast_utils.dart';
+import 'douyin_resolver.dart';
 
 /// Uses a locally installed yt-dlp executable. Keeping the extractor outside
 /// the app makes site support updateable without shipping site-specific code.
@@ -38,9 +39,11 @@ class VideoDownloaderCtl extends GetxController {
   bool _overallTotalEstimated = false;
   final Map<String, int> _downloadedBytesByFormat = {};
   DateTime? _lastProgressLogAt;
+  bool _cancelRequested = false;
 
   Future<void> start() async {
-    final inputUrl = urlController.text.trim();
+    final inputText = urlController.text.trim();
+    final inputUrl = DouyinResolver.extractUrl(inputText) ?? inputText;
     final uri = Uri.tryParse(inputUrl);
     if (uri == null ||
         !uri.hasScheme ||
@@ -68,7 +71,14 @@ class VideoDownloaderCtl extends GetxController {
       return;
     }
 
+    final isDouyin = DouyinResolver.isDouyinUrl(uri);
+    if (isDouyin && !DouyinResolver.isSupportedPlatform) {
+      showToast('当前系统暂不支持抖音解析');
+      return;
+    }
+
     isDownloading.value = true;
+    _cancelRequested = false;
     progress.value = 0;
     speed.value = '--';
     downloaded.value = '0 B';
@@ -85,10 +95,67 @@ class VideoDownloaderCtl extends GetxController {
     status.value = '正在解析视频…';
     _addLog('使用下载引擎：$executable');
 
+    var targetUrl = inputUrl;
+    var outputTemplate = '%(title).200B.%(ext)s';
+    final extraArgs = <String>[];
+    if (isDouyin) {
+      status.value = '正在解析抖音视频…';
+      try {
+        final videoId = await DouyinResolver.resolveVideoId(
+          uri,
+          onLog: _addDouyinLog,
+        );
+        _addDouyinLog('作品 ID：$videoId');
+        final video = await DouyinResolver.resolve(
+          videoId,
+          onLog: _addDouyinLog,
+          isCancelled: () => _cancelRequested,
+        );
+        _addDouyinLog(
+          '已获取视频地址：${video.width}x${video.height} '
+          '${video.isH265 ? 'H.265' : 'H.264'}'
+          '${video.size > 0 ? '，${_formatBytes(video.size)}' : ''}',
+        );
+        if (video.size > 0) {
+          _overallTotalBytes = video.size;
+          total.value = _formatBytes(video.size);
+        }
+        targetUrl = video.url;
+        // yt-dlp treats % as a template field; keep the title literal.
+        outputTemplate = '${video.title.replaceAll('%', '%%')}.%(ext)s';
+        extraArgs.addAll([
+          '--add-header',
+          'Referer:${DouyinResolver.referer}',
+          '--user-agent',
+          DouyinResolver.userAgent,
+        ]);
+      } on DouyinResolveException catch (e) {
+        status.value = _cancelRequested ? '已取消' : '抖音解析失败';
+        _addDouyinLog(e.message);
+        isDownloading.value = false;
+        return;
+      } catch (e) {
+        status.value = '抖音解析失败';
+        _addDouyinLog(e.toString());
+        isDownloading.value = false;
+        return;
+      }
+      if (_cancelRequested) {
+        status.value = '已取消';
+        isDownloading.value = false;
+        return;
+      }
+    }
+
     const marker = '__FTB_PROGRESS__';
     const fileMarker = '__FTB_FILE__';
     const metaMarker = '__FTB_META__';
     final args = <String>[
+      ...extraArgs,
+      // On Windows a piped yt-dlp otherwise writes in the console code page
+      // (e.g. GBK), which garbles Chinese titles and file paths.
+      '--encoding',
+      'utf-8',
       '--no-playlist',
       '--no-simulate',
       '--no-quiet',
@@ -106,20 +173,21 @@ class VideoDownloaderCtl extends GetxController {
       '-P',
       destination.path,
       '-o',
-      '%(title).200B.%(ext)s',
-      inputUrl,
+      outputTemplate,
+      targetUrl,
     ];
 
     try {
       _process = await Process.start(executable, args, runInShell: false);
       status.value = '正在连接并下载…';
       _startFallbackProgressMonitor(destination);
+      const decoder = Utf8Decoder(allowMalformed: true);
       _stdoutSubscription = _process!.stdout
-          .transform(utf8.decoder)
+          .transform(decoder)
           .transform(const LineSplitter())
           .listen(_handleOutputLine);
       _stderrSubscription = _process!.stderr
-          .transform(utf8.decoder)
+          .transform(decoder)
           .transform(const LineSplitter())
           .listen(_handleOutputLine);
 
@@ -155,8 +223,13 @@ class VideoDownloaderCtl extends GetxController {
   }
 
   void cancel() {
+    if (!isDownloading.value) return;
+    _cancelRequested = true;
     final process = _process;
-    if (process == null) return;
+    if (process == null) {
+      status.value = '正在取消…';
+      return;
+    }
     status.value = '已取消';
     _addLog('正在取消下载…');
     process.kill(ProcessSignal.sigterm);
@@ -322,7 +395,7 @@ class VideoDownloaderCtl extends GetxController {
       _overallTotalEstimated = isEstimate;
       total.value = '${isEstimate ? '约 ' : ''}${_formatBytes(sum)}';
       _addLog('[yt-dlp] 已获取${isEstimate ? '估算' : '精确'}总大小：${total.value}');
-    } else {
+    } else if (_overallTotalBytes == null) {
       _addLog('[yt-dlp] 服务器未提供视频总大小，将使用实时下载进度');
     }
   }
@@ -446,6 +519,8 @@ class VideoDownloaderCtl extends GetxController {
     } while (value >= 1024 && unit < units.length - 1);
     return '${value.toStringAsFixed(value >= 100 ? 0 : 1)} ${units[unit]}';
   }
+
+  void _addDouyinLog(String value) => _addLog('[抖音] $value');
 
   void _addLog(String value) {
     logLines.add(value);

@@ -27,8 +27,8 @@ class VideoDownloaderPage extends StatelessWidget {
               controller: ctl.urlController,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(
-                labelText: '视频页面网址',
-                hintText: 'https://example.com/video',
+                labelText: '视频页面网址 / 抖音分享文案',
+                hintText: 'https://example.com/video，或直接粘贴抖音“复制链接”的内容',
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.link),
               ),
